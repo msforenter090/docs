@@ -1,4 +1,9 @@
-# CPU Frontend Block Diagram (Intel Skylake)
+# CPU Frontend Block Diagram
+
+A common mental model for the frontend of a modern out-of-order CPU. The
+blocks and their order are broadly the same across Intel, AMD, and ARM —
+the names and sizes differ, and some blocks are specific to variable-length
+ISAs (see notes below the diagram).
 
 ```
                         CPU FRONTEND
@@ -17,49 +22,84 @@
 │   ┌──────────────────────────▼──────────────────────────┐  │
 │   │                 Instruction Fetch Unit               │  │
 │   │        ┌─────────────────┐   ┌──────────────┐       │  │
-│   │        │   L1 ICache     │   │     ITLB     │       │  │
-│   │        │   (32KB, 8-way) │   │  (128 entry) │       │  │
+│   │        │    L1 ICache    │   │     ITLB     │       │  │
 │   │        └────────┬────────┘   └──────────────┘       │  │
 │   └─────────────────┼───────────────────────────────────┘  │
-│                     │ raw x86 bytes (up to 16B/cycle)       │
+│                     │ raw instruction bytes                 │
 │   ┌─────────────────▼───────────────────────────────────┐  │
-│   │            Pre-decode / ILD                         │  │
-│   │        (finds instruction boundaries)               │  │
+│   │                  Pre-decode / ILD                   │  │
+│   │            (finds instruction boundaries)           │  │
 │   └─────────────────┬───────────────────────────────────┘  │
 │                     │                                       │
 │   ┌─────────────────▼───────────────────────────────────┐  │
-│   │              Instruction Queue (IQ)                 │  │
+│   │               Instruction Queue (IQ)               │  │
 │   └──────────────┬──────────────────────────────────────┘  │
 │                  │                                          │
 │      ┌───────────▼───────────┐   ┌───────────────────────┐ │
-│      │        Decode         │   │          DSB          │ │
-│      │   (Legacy / MITE)     │   │  (Decoded Stream      │ │
-│      │  4 decoders           │   │   Buffer)             │ │
-│      │  4 uops/cycle         │   │  1536 uops            │ │
-│      │                       │   │  6 uops/cycle         │ │
+│      │        Decode         │   │      uop Cache        │ │
+│      │   (legacy path)       │   │   (decoded-uop        │ │
+│      │   x86 → uops          │   │    fast path)         │ │
 │      └───────────┬───────────┘   └───────────┬───────────┘ │
 │                  │                            │             │
 │                  └──────────────┬─────────────┘             │
 │                                 │                           │
-│                  ┌──────────────▼─────────────┐             │
-│                  │             LSD             │             │
-│                  │   (Loop Stream Detector)    │             │
-│                  │   ~25 uops, 0 fetch cost    │             │
-│                  └──────────────┬──────────────┘             │
+│                  ┌──────────────▼──────────────┐            │
+│                  │             LSD             │            │
+│                  │   (Loop Stream Detector)    │            │
+│                  └──────────────┬──────────────┘            │
 │                                 │                           │
-│                  ┌──────────────▼─────────────┐             │
-│                  │             IDQ             │             │
-│                  │  (Instruction Decode Queue) │             │
-│                  │   64 entries               │             │
-│                  └──────────────┬──────────────┘             │
+│                  ┌──────────────▼──────────────┐            │
+│                  │             IDQ             │            │
+│                  │  (Instruction Decode Queue) │            │
+│                  └──────────────┬──────────────┘            │
 │                                 │                           │
 └─────────────────────────────────┼───────────────────────────┘
-                                  │ up to 4 uops/cycle
+                                  │ uops
                     ┌─────────────▼──────────────┐
                     │           BACKEND           │
                     │     (Allocator / Renamer)   │
                     └─────────────────────────────┘
 ```
+
+**ISA notes:**
+- **Variable-length ISAs (x86):** need a heavy **Pre-decode / ILD** stage to
+  find instruction boundaries before decoding, which is why the **uop cache**
+  exists — to skip that expensive work on repeat execution. The **LSD** is a
+  further optimization for tiny loops.
+- **Fixed-width ISAs (ARM/AArch64, RISC-V):** instruction boundaries are
+  trivial (step by a fixed width), so pre-decode is minimal and a uop cache is
+  often unnecessary. These designs tend to drop the uop cache/LSD and instead
+  decode very wide directly.
+
+---
+
+## Typical Values Across Architectures
+
+Rough figures to build intuition — exact numbers vary by specific core revision.
+"—" means the block is absent or not applicable on that design.
+
+| Block / metric        | Intel Skylake   | AMD Zen 3        | Apple M1 (Firestorm) |
+|-----------------------|-----------------|------------------|----------------------|
+| ISA                   | x86-64 (var len)| x86-64 (var len) | AArch64 (fixed 4B)   |
+| L1 ICache             | 32 KB, 8-way    | 32 KB, 8-way     | 192 KB               |
+| ITLB entries (4K)     | 128             | 64               | ~256                 |
+| Fetch width           | 16 B/cycle      | 32 B/cycle       | 8 instr/cycle        |
+| Legacy decode width   | 4 instr/cycle   | 4 instr/cycle    | 8 instr/cycle        |
+| uop cache             | DSB, 1536 uops  | Op cache, ~4096  | — (not needed)       |
+| uop cache deliver     | 6 uops/cycle    | 8 ops/cycle      | —                    |
+| LSD                   | yes (~25 uops)  | — (op cache)     | —                    |
+| IDQ depth             | 64 uops         | ~? (op queue)    | very large           |
+| Rename/issue width    | 4 uops/cycle    | 6 uops/cycle     | 8 uops/cycle         |
+| Branch mispred penalty| ~16 cycles      | ~17 cycles       | ~13 cycles           |
+
+Takeaways:
+- **x86 cores** (Intel/AMD) lean on a uop cache to dodge expensive variable-length
+  decode; AMD's op cache is larger and wider than Intel's DSB.
+- **Apple M1** has no uop cache at all — fixed-width AArch64 makes decode cheap,
+  so it just decodes 8-wide directly and spends the transistor budget on a huge
+  L1 ICache and reorder window instead.
+- Decode/rename **width grows** as you move toward wider designs (4 → 6 → 8),
+  which is the headline frontend throughput number.
 
 ---
 
@@ -69,49 +109,49 @@
 Predicts the next fetch address before the current instruction finishes executing.
 Contains three sub-structures: BTB for branch targets, BHB for branch history
 patterns, and RSB for return addresses. A misprediction flushes the pipeline
-and costs ~15-20 cycles.
+and costs on the order of 15–20 cycles.
 
 **L1 ICache**
-32KB 8-way set-associative instruction cache. Delivers up to 16 bytes of raw
-x86 bytes per cycle to the pre-decoder. On a miss, fetches from L2 (4-cycle
-penalty) or L3/DRAM.
+First-level instruction cache. Delivers raw instruction bytes to the
+pre-decoder each cycle. On a miss, fetches from L2, then L3/DRAM.
 
 **ITLB**
-Translates virtual instruction addresses to physical. 128 entries for 4KB
-pages on Skylake. A miss triggers a page table walk costing hundreds of cycles.
+Translates virtual instruction addresses to physical. A miss triggers a page
+table walk costing hundreds of cycles.
 
 **Pre-decode / ILD (Instruction Length Decoder)**
-Scans the raw byte stream to find instruction boundaries. x86 instructions
-are variable length (1–15 bytes), so this step must happen before decoding.
-Outputs up to 6 instruction boundaries per cycle.
+Scans the raw byte stream to find instruction boundaries. Needed for
+variable-length ISAs where instructions span a range of byte widths, so this
+step must happen before decoding. Minimal on fixed-width ISAs.
 
 **Instruction Queue (IQ)**
 Small buffer between pre-decode and the decoders. Absorbs bubbles caused by
 pre-decode throughput variations.
 
-**Decode (MITE — Micro-instruction Translation Engine)**
-The legacy decode path. Converts x86 instructions into uops. Has 4 decoders
-on Skylake (1 complex decoder handles up to 4 uops per instruction, 3 simple
-decoders handle 1 uop each). Active only on DSB misses.
+**Decode (legacy path)**
+Converts architectural instructions into uops. Typically several decoders in
+parallel (one complex + several simple). Active when the uop cache misses.
 
-**DSB (Decoded Stream Buffer)**
+**uop Cache**
 Caches already-decoded uops indexed by instruction address. On a hit, uops
-flow directly to the IDQ at up to 6 uops/cycle, bypassing pre-decode and
-decode entirely. Capacity: 1536 uops (32 sets × 8 ways × 6 uops per way).
+flow directly to the IDQ, bypassing pre-decode and decode entirely — the main
+frontend fast path on variable-length ISAs.
 
 **LSD (Loop Stream Detector)**
-Detects small loops that fit entirely within the IDQ (~25 uops). Locks them
-in the IDQ and replays them without going back to the DSB or decode. Zero
-frontend overhead — the best possible case for tight loops.
+Detects small loops that fit entirely within the IDQ. Locks them in the IDQ
+and replays them without going back to the uop cache or decode. Zero frontend
+overhead — the best possible case for tight loops.
 
 **IDQ (Instruction Decode Queue)**
-64-entry buffer between the frontend and backend. Acts as the handoff point.
-The backend pulls up to 4 uops/cycle from the IDQ. Frontend stalls show up
-as IDQ empty cycles.
+Buffer between the frontend and backend. Acts as the handoff point. The
+backend pulls uops from the IDQ. Frontend stalls show up as IDQ empty cycles.
 
 ---
 
 ## Parameters & Perf Events
+
+Perf event names below are Intel-specific (use `perf list` for your CPU; AMD
+and ARM expose analogous counters under different names).
 
 | Block       | Parameter              | Description                                      | Perf Event                              |
 |-------------|------------------------|--------------------------------------------------|-----------------------------------------|
@@ -123,11 +163,11 @@ as IDQ empty cycles.
 | L1 ICache   | Miss penalty           | Cycles stalled on L1 icache miss                 | `icache_64b.iftag_stall`                |
 | ITLB        | Miss rate              | Instruction address translations that miss ITLB  | `iTLB-load-misses`                      |
 | ITLB        | Miss penalty           | Cycles stalled on ITLB miss / page walk          | `itlb_misses.walk_duration`             |
-| Decode      | Legacy decode uops     | uops coming from slow decode path (not DSB)      | `idq.mite_uops`                         |
+| Decode      | Legacy decode uops     | uops coming from slow decode path (not uop cache)| `idq.mite_uops`                         |
 | Decode      | Legacy decode cycles   | Cycles the legacy decoder was active             | `idq.mite_cycles`                       |
-| DSB         | DSB uops               | uops delivered from DSB (fast path)              | `idq.dsb_uops`                          |
-| DSB         | DSB active cycles      | Cycles DSB was delivering uops                   | `idq.dsb_cycles`                        |
-| DSB         | DSB → MITE switches    | Penalty cycles when falling back from DSB        | `dsb2mite_switches.penalty_cycles`      |
+| uop Cache   | uop-cache uops         | uops delivered from the uop cache (fast path)    | `idq.dsb_uops`                          |
+| uop Cache   | uop-cache active cycles| Cycles the uop cache was delivering uops         | `idq.dsb_cycles`                        |
+| uop Cache   | Fallback switches      | Penalty cycles when falling back to legacy decode| `dsb2mite_switches.penalty_cycles`      |
 | LSD         | LSD uops               | uops delivered by the loop stream detector       | `lsd.uops`                              |
 | LSD         | LSD active cycles      | Cycles the LSD was active                        | `lsd.cycles_active`                     |
 | LSD         | LSD not active         | Cycles LSD could have been used but wasn't       | `lsd.not_active`                        |
